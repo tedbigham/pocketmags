@@ -1,0 +1,15 @@
+{
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite build --watch",
+    "run:firefox": "web-ext run",
+    "sign": "web-ext sign"
+  },
+  "dependencies": {
+    "pdf-lib": "^1.17.1"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0",
+    "web-ext": "^8.0.0"
+  }
+}
