@@ -5,32 +5,35 @@ const UUID_RE =
 
 const QUALITY_LEVELS = ["extralow", "low", "mid", "high", "extrahigh"];
 const QUALITY_RE = QUALITY_LEVELS.join("|");
-
 const BIN_RE = new RegExp(`/(${QUALITY_RE})/\\d{4}\\.bin(?:\\?|$)`);
 
 const PARALLEL_DOWNLOADS = 20;
 
-let detectedJob = null;
-let cancelRequested = false;
+const detectedJobs = new Map(); // tabId -> job
+const tasks = new Map(); // tabId -> { running, message, pages, cancelRequested }
 
-let taskStatus = {
-    running: false,
-    message: "",
-    pages: 0
-};
-
-function setStatus(message, pages = taskStatus.pages) {
-    taskStatus = {
-        running: taskStatus.running,
-        message,
-        pages
+function getTask(tabId) {
+    return tasks.get(tabId) || {
+        running: false,
+        message: "",
+        pages: 0,
+        cancelRequested: false
     };
 }
 
+function setTask(tabId, patch) {
+    const current = getTask(tabId);
+    const next = { ...current, ...patch };
+    tasks.set(tabId, next);
+    return next;
+}
+
+function setStatus(tabId, message, pages = getTask(tabId).pages) {
+    setTask(tabId, { message, pages });
+}
+
 function clearBadge(tabId) {
-    if (tabId >= 0) {
-        browser.browserAction.setBadgeText({ tabId, text: "" });
-    }
+    if (tabId >= 0) browser.browserAction.setBadgeText({ tabId, text: "" });
 }
 
 function markDetected(tabId) {
@@ -61,6 +64,11 @@ function sanitizeFilenamePart(value) {
         .slice(0, 120);
 }
 
+async function getActiveTabId() {
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+    return tab?.id ?? null;
+}
+
 async function getPageTitleParts(tabId) {
     if (tabId < 0) return null;
 
@@ -76,10 +84,7 @@ async function getPageTitleParts(tabId) {
         });
 
         const parts = results?.[0];
-
-        if (!parts?.name && !parts?.issue) {
-            return null;
-        }
+        if (!parts?.name && !parts?.issue) return null;
 
         return {
             name: sanitizeFilenamePart(parts.name || ""),
@@ -95,18 +100,16 @@ async function capturePageTitlePartsWithRetry(tabId) {
     const delays = [0, 500, 1000, 2000, 4000];
 
     for (const delay of delays) {
-        if (delay > 0) {
-            await new Promise(resolve => setTimeout(resolve, delay));
-        }
+        if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
 
-        if (!detectedJob || detectedJob.tabId !== tabId) {
-            return;
-        }
+        const job = detectedJobs.get(tabId);
+        if (!job) return;
 
         const parts = await getPageTitleParts(tabId);
 
         if (parts) {
-            detectedJob.pageParts = parts;
+            job.pageParts = parts;
+            detectedJobs.set(tabId, job);
             console.log("Captured page title parts:", parts);
             return;
         }
@@ -122,9 +125,7 @@ function formatHeader(bytes) {
 }
 
 function repairImageHeader(bytes) {
-    if (bytes.length < 12) {
-        throw new Error("File too small");
-    }
+    if (bytes.length < 12) throw new Error("File too small");
 
     const fixed = new Uint8Array(bytes);
 
@@ -148,11 +149,7 @@ function repairImageHeader(bytes) {
         fixed[6] = (riffSize >> 16) & 0xff;
         fixed[7] = (riffSize >> 24) & 0xff;
 
-        return {
-            type: "webp",
-            mimeType: "image/webp",
-            bytes: fixed
-        };
+        return { mimeType: "image/webp", bytes: fixed };
     }
 
     if (
@@ -168,11 +165,7 @@ function repairImageHeader(bytes) {
         fixed[0] = 0xff;
         fixed[1] = 0xd8;
 
-        return {
-            type: "jpg",
-            mimeType: "image/jpeg",
-            bytes: fixed
-        };
+        return { mimeType: "image/jpeg", bytes: fixed };
     }
 
     throw new Error(`unknown image header: ${formatHeader(fixed)}`);
@@ -201,32 +194,22 @@ async function imageBytesToJpegBytes(bytes, mimeType) {
     };
 }
 
-async function fetchAndProcessPage(index, downloadBaseUrl) {
+async function fetchAndProcessPage(tabId, index, downloadBaseUrl) {
     const filename = `${String(index).padStart(4, "0")}.bin`;
     const url = downloadBaseUrl + filename;
 
-    setStatus(`Downloading ${filename}`, taskStatus.pages);
+    setStatus(tabId, `Downloading ${filename}`);
 
     const response = await fetch(url);
 
     if (!response.ok) {
-        return {
-            index,
-            stop: true,
-            reason: `HTTP ${response.status}`,
-            filename
-        };
+        return { index, stop: true, reason: `HTTP ${response.status}`, filename };
     }
 
     const rawBytes = new Uint8Array(await response.arrayBuffer());
 
     if (!rawBytes.length) {
-        return {
-            index,
-            stop: true,
-            reason: "empty response",
-            filename
-        };
+        return { index, stop: true, reason: "empty response", filename };
     }
 
     let repaired;
@@ -234,18 +217,12 @@ async function fetchAndProcessPage(index, downloadBaseUrl) {
     try {
         repaired = repairImageHeader(rawBytes);
     } catch (e) {
-        return {
-            index,
-            skip: true,
-            reason: e.message,
-            filename
-        };
+        return { index, skip: true, reason: e.message, filename };
     }
 
-    let jpeg;
-
     try {
-        jpeg = await imageBytesToJpegBytes(repaired.bytes, repaired.mimeType);
+        const jpeg = await imageBytesToJpegBytes(repaired.bytes, repaired.mimeType);
+        return { index, filename, jpeg };
     } catch (e) {
         return {
             index,
@@ -254,41 +231,31 @@ async function fetchAndProcessPage(index, downloadBaseUrl) {
             filename
         };
     }
-
-    return {
-        index,
-        filename,
-        jpeg
-    };
 }
 
-function buildOutputFilename(selectedQuality) {
-    const pageParts = detectedJob?.pageParts;
+function buildOutputFilename(job, selectedQuality) {
+    const pageParts = job?.pageParts;
 
     const baseFilename = pageParts
         ? `${pageParts.name} - ${pageParts.issue}`.replace(/ - $/, "").trim()
-        : detectedJob.outputName;
+        : job.outputName;
 
     return `${baseFilename}_${selectedQuality}.pdf`;
 }
 
-async function runPdfDownload(selectedQuality) {
-    if (!detectedJob) throw new Error("No matching URL detected yet.");
+async function runPdfDownload(tabId, selectedQuality) {
+    const job = detectedJobs.get(tabId);
+    if (!job) throw new Error("No matching URL detected yet.");
 
-    taskStatus = {
+    setTask(tabId, {
         running: true,
         message: "Starting...",
-        pages: 0
-    };
+        pages: 0,
+        cancelRequested: false
+    });
 
-    cancelRequested = false;
-
-    const downloadBaseUrl = replaceQualityInBaseUrl(
-        detectedJob.baseUrl,
-        selectedQuality
-    );
-
-    const outputFilename = buildOutputFilename(selectedQuality);
+    const downloadBaseUrl = replaceQualityInBaseUrl(job.baseUrl, selectedQuality);
+    const outputFilename = buildOutputFilename(job, selectedQuality);
 
     const pdfDoc = await PDFDocument.create();
     let pageCount = 0;
@@ -296,13 +263,13 @@ async function runPdfDownload(selectedQuality) {
     let shouldStop = false;
 
     while (!shouldStop) {
-        if (cancelRequested) {
-            taskStatus = {
+        if (getTask(tabId).cancelRequested) {
+            setTask(tabId, {
                 running: false,
                 message: `Cancelled after ${pageCount} pages.`,
-                pages: pageCount
-            };
-            cancelRequested = false;
+                pages: pageCount,
+                cancelRequested: false
+            });
             return;
         }
 
@@ -313,30 +280,30 @@ async function runPdfDownload(selectedQuality) {
         }
 
         const results = await Promise.all(
-            batchIndexes.map(index => fetchAndProcessPage(index, downloadBaseUrl))
+            batchIndexes.map(index => fetchAndProcessPage(tabId, index, downloadBaseUrl))
         );
 
         results.sort((a, b) => a.index - b.index);
 
         for (const result of results) {
-            if (cancelRequested) {
-                taskStatus = {
+            if (getTask(tabId).cancelRequested) {
+                setTask(tabId, {
                     running: false,
                     message: `Cancelled after ${pageCount} pages.`,
-                    pages: pageCount
-                };
-                cancelRequested = false;
+                    pages: pageCount,
+                    cancelRequested: false
+                });
                 return;
             }
 
             if (result.stop) {
-                setStatus(`Stopping at ${result.filename}: ${result.reason}`, pageCount);
+                setStatus(tabId, `Stopping at ${result.filename}: ${result.reason}`, pageCount);
                 shouldStop = true;
                 break;
             }
 
             if (result.skip) {
-                setStatus(`Skipping ${result.filename}: ${result.reason}`, pageCount);
+                setStatus(tabId, `Skipping ${result.filename}: ${result.reason}`, pageCount);
                 continue;
             }
 
@@ -351,17 +318,23 @@ async function runPdfDownload(selectedQuality) {
             });
 
             pageCount++;
-            setStatus(`Added page ${pageCount}`, pageCount);
+            setStatus(tabId, `Added page ${pageCount}`, pageCount);
         }
 
         nextIndex += PARALLEL_DOWNLOADS;
     }
 
     if (pageCount === 0) {
-        throw new Error("No valid pages found.");
+        setTask(tabId, {
+            running: false,
+            message: "Error: No valid pages found.",
+            pages: 0,
+            cancelRequested: false
+        });
+        return;
     }
 
-    setStatus(`Saving ${outputFilename}...`, pageCount);
+    setStatus(tabId, `Saving ${outputFilename}...`, pageCount);
 
     const pdfBytes = await pdfDoc.save();
     const pdfBlob = new Blob([pdfBytes], { type: "application/pdf" });
@@ -374,27 +347,24 @@ async function runPdfDownload(selectedQuality) {
         conflictAction: "uniquify"
     });
 
-    setTimeout(() => {
-        URL.revokeObjectURL(objectUrl);
-    }, 60_000);
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
 
-    taskStatus = {
+    setTask(tabId, {
         running: false,
         message: `Saved ${outputFilename} with ${pageCount} pages.`,
-        pages: pageCount
-    };
+        pages: pageCount,
+        cancelRequested: false
+    });
 }
 
 browser.webRequest.onCompleted.addListener(
     details => {
-        // Ignore extension/background fetches. Otherwise our own downloads overwrite
-        // the page-based detectedJob and lose DOM-readable title metadata.
         if (details.tabId < 0) return;
 
         const match = details.url.match(BIN_RE);
         if (!match) return;
 
-        detectedJob = {
+        const job = {
             tabId: details.tabId,
             sampleUrl: details.url,
             baseUrl: extractBaseUrl(details.url),
@@ -403,10 +373,12 @@ browser.webRequest.onCompleted.addListener(
             pageParts: null
         };
 
+        detectedJobs.set(details.tabId, job);
+
         markDetected(details.tabId);
         capturePageTitlePartsWithRetry(details.tabId);
 
-        console.log("Detected magazine source:", detectedJob);
+        console.log("Detected magazine source:", job);
     },
     { urls: ["<all_urls>"] }
 );
@@ -415,56 +387,66 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
     if (changeInfo.status !== "loading") return;
 
     clearBadge(tabId);
+    detectedJobs.delete(tabId);
 
-    if (detectedJob?.tabId === tabId) {
-        detectedJob = null;
+    const task = getTask(tabId);
+    if (task.running) {
+        setTask(tabId, { cancelRequested: true });
     }
 });
 
 browser.tabs.onRemoved.addListener(tabId => {
-    if (detectedJob?.tabId === tabId) {
-        detectedJob = null;
+    detectedJobs.delete(tabId);
+
+    const task = getTask(tabId);
+    if (task.running) {
+        setTask(tabId, { cancelRequested: true });
     }
 });
 
-browser.runtime.onMessage.addListener(message => {
+browser.runtime.onMessage.addListener(async message => {
+    const tabId = await getActiveTabId();
+
     if (message?.type === "getDetectedJob") {
-        return Promise.resolve(detectedJob);
+        return tabId == null ? null : detectedJobs.get(tabId) || null;
     }
 
     if (message?.type === "getStatus") {
-        return Promise.resolve(taskStatus);
+        return tabId == null ? getTask(-1) : getTask(tabId);
     }
 
     if (message?.type === "cancelPdfDownload") {
-        cancelRequested = true;
-        return Promise.resolve({ ok: true });
+        if (tabId != null) {
+            setTask(tabId, { cancelRequested: true });
+        }
+        return { ok: true };
     }
 
     if (message?.type === "startPdfDownload") {
-        if (taskStatus.running) {
-            return Promise.resolve({
-                ok: false,
-                error: "Download already running."
-            });
+        if (tabId == null || !detectedJobs.has(tabId)) {
+            return { ok: false, error: "No matching URL detected for this tab." };
+        }
+
+        if (getTask(tabId).running) {
+            return { ok: false, error: "Download already running for this tab." };
         }
 
         const quality = QUALITY_LEVELS.includes(message.quality)
             ? message.quality
             : "extrahigh";
 
-        browser.storage.local.set({ quality });
+        await browser.storage.local.set({ quality });
 
-        runPdfDownload(quality).catch(e => {
-            taskStatus = {
+        runPdfDownload(tabId, quality).catch(e => {
+            setTask(tabId, {
                 running: false,
                 message: `Error: ${e.message || String(e)}`,
-                pages: taskStatus.pages
-            };
+                cancelRequested: false
+            });
         });
 
-        return Promise.resolve({ ok: true });
+        return { ok: true };
     }
 
-    return Promise.resolve(null);
+    return null;
 });

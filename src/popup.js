@@ -60,15 +60,7 @@ function startPolling() {
         if (!status?.running) {
             clearInterval(pollTimer);
             pollTimer = null;
-
-            running = false;
-            downloadBtn.textContent = "Download PDF";
-            downloadBtn.disabled = false;
-
-            if (status?.message) {
-                statusEl.textContent = status.message;
-            }
-
+            await refresh();
             return;
         }
 

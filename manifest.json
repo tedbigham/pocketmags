@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Magazine Bin to PDF",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Detect numbered magazine .bin image requests and download them as a PDF.",
   "permissions": [
     "webRequest",
