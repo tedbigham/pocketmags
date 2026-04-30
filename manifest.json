@@ -1,17 +1,13 @@
 {
   "manifest_version": 2,
   "name": "Magazine Bin to PDF",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Detect numbered magazine .bin image requests and download them as a PDF.",
-  "browser_specific_settings": {
-    "gecko": {
-      "id": "{59953640-adbc-439d-9c38-e0ca5b0939af}"
-    }
-  },
   "permissions": [
     "webRequest",
     "downloads",
     "tabs",
+    "storage",
     "<all_urls>"
   ],
   "background": {
@@ -20,5 +16,10 @@
   "browser_action": {
     "default_title": "Magazine PDF",
     "default_popup": "src/popup.html"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "{59953640-adbc-439d-9c38-e0ca5b0939af}"
+    }
   }
 }

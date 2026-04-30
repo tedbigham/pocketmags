@@ -9,6 +9,7 @@
             padding: 12px;
         }
 
+        select,
         button {
             width: 100%;
             padding: 8px;
@@ -24,6 +25,15 @@
 </head>
 <body>
 <strong>Magazine PDF</strong>
+
+<select id="quality">
+    <option value="extralow">Extra Low</option>
+    <option value="low">Low</option>
+    <option value="mid">Mid</option>
+    <option value="high">High</option>
+    <option value="extrahigh" selected>Extra High</option>
+</select>
+
 <div id="status">Checking...</div>
 <button id="download" disabled>Download PDF</button>
 

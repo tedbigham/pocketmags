@@ -1,11 +1,40 @@
 const statusEl = document.getElementById("status");
 const downloadBtn = document.getElementById("download");
+const qualitySelect = document.getElementById("quality");
 
 let running = false;
-let port = null;
+let pollTimer = null;
+
+function formatDetectedName(job) {
+    if (job?.pageParts) {
+        const name = job.pageParts.name || "";
+        const issue = job.pageParts.issue || "";
+        return `${name} - ${issue}`.replace(/ - $/, "").trim();
+    }
+
+    return job?.outputName || "";
+}
+
+async function loadQuality() {
+    const stored = await browser.storage.local.get({ quality: "extrahigh" });
+    qualitySelect.value = stored.quality;
+}
 
 async function refresh() {
+    const status = await browser.runtime.sendMessage({ type: "getStatus" });
     const job = await browser.runtime.sendMessage({ type: "getDetectedJob" });
+
+    if (status?.running) {
+        running = true;
+        downloadBtn.textContent = "Cancel";
+        downloadBtn.disabled = false;
+        statusEl.textContent = status.message || "Running...";
+        startPolling();
+        return;
+    }
+
+    running = false;
+    downloadBtn.textContent = "Download PDF";
 
     if (!job) {
         statusEl.textContent = "No matching .bin request detected yet.";
@@ -13,26 +42,66 @@ async function refresh() {
         return;
     }
 
-    statusEl.textContent = `Detected: ${job.outputName}`;
+    const displayName = formatDetectedName(job);
+
+    statusEl.textContent = displayName
+        ? `Detected: ${displayName}`
+        : "Detected";
+
     downloadBtn.disabled = false;
 }
 
-function resetButton() {
-    running = false;
-    downloadBtn.textContent = "Download PDF";
-    downloadBtn.disabled = false;
+function startPolling() {
+    if (pollTimer) return;
 
-    if (port) {
-        port.disconnect();
-        port = null;
-    }
+    pollTimer = setInterval(async () => {
+        const status = await browser.runtime.sendMessage({ type: "getStatus" });
+
+        if (!status?.running) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+
+            running = false;
+            downloadBtn.textContent = "Download PDF";
+            downloadBtn.disabled = false;
+
+            if (status?.message) {
+                statusEl.textContent = status.message;
+            }
+
+            return;
+        }
+
+        statusEl.textContent = status.message || "Running...";
+    }, 500);
 }
 
-downloadBtn.addEventListener("click", () => {
+qualitySelect.addEventListener("change", async () => {
+    await browser.storage.local.set({
+        quality: qualitySelect.value
+    });
+});
+
+downloadBtn.addEventListener("click", async () => {
     if (running) {
         statusEl.textContent = "Cancelling...";
         downloadBtn.disabled = true;
-        port?.postMessage({ type: "cancel" });
+
+        await browser.runtime.sendMessage({ type: "cancelPdfDownload" });
+        return;
+    }
+
+    await browser.storage.local.set({
+        quality: qualitySelect.value
+    });
+
+    const result = await browser.runtime.sendMessage({
+        type: "startPdfDownload",
+        quality: qualitySelect.value
+    });
+
+    if (!result?.ok) {
+        statusEl.textContent = result?.error || "Could not start download.";
         return;
     }
 
@@ -41,48 +110,10 @@ downloadBtn.addEventListener("click", () => {
     downloadBtn.disabled = false;
     statusEl.textContent = "Starting...";
 
-    port = browser.runtime.connect({ name: "pdf-download" });
-
-    port.onMessage.addListener(message => {
-        if (message.type === "progress") {
-            if (message.phase === "downloading") {
-                statusEl.textContent = `Downloading (page: ${message.current})`;
-            }
-
-            if (message.phase === "skipping") {
-                statusEl.textContent = `Skipping ${message.filename}: ${message.reason}`;
-            }
-
-            if (message.phase === "stopping") {
-                statusEl.textContent = `Stopping at ${message.filename}: ${message.reason}`;
-            }
-
-            if (message.phase === "saving") {
-                statusEl.textContent = `Saving PDF with ${message.pages} pages...`;
-            }
-
-            if (message.phase === "cancelled") {
-                statusEl.textContent = `Cancelled after ${message.pages} pages.`;
-            }
-        }
-
-        if (message.type === "complete") {
-            statusEl.textContent = `Saved PDF with ${message.pages} pages.`;
-            resetButton();
-        }
-
-        if (message.type === "cancelled") {
-            statusEl.textContent = `Cancelled after ${message.pages} pages.`;
-            resetButton();
-        }
-
-        if (message.type === "error") {
-            statusEl.textContent = `Error: ${message.message}`;
-            resetButton();
-        }
-    });
-
-    port.postMessage({ type: "downloadPdf" });
+    startPolling();
 });
 
-refresh();
+(async () => {
+    await loadQuality();
+    await refresh();
+})();
